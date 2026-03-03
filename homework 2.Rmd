@@ -1,0 +1,208 @@
+---
+title: "P8106_hw2_yw4662"
+author: "Ye Wen"
+date: "2026-03-010"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup + Train/Test Split
+
+```{r}
+library(tidyverse)
+
+college <- read_csv("./data/College.csv")
+
+if (!is.numeric(college[[1]]) && anyDuplicated(college[[1]]) == 0) {
+  rownames(college) <- college[[1]]
+  college <- college[, -1]
+}
+
+set.seed(1)
+n <- nrow(college)
+train_id <- sample(1:n, size = floor(0.8*n), replace = FALSE)
+
+train <- college[train_id, ]
+test  <- college[-train_id, ]
+
+y_train <- train$Outstate
+y_test  <- test$Outstate
+```
+
+## Question a: Smoothing spline model
+
+### Answer
+
+As the degrees of freedom increase, the spline becomes more flexible. With low df, the fit is very smooth and looks close to a straight line, capturing only the overall upward trend of Outstate with Top10perc. With moderate df, the curve starts to pick up gentle curvature. At higher df, the fit becomes noticeably wiggly, especially in the mid-to-high Top10perc range, suggesting it may be chasing noise rather than the main signal.
+
+I chose df=3. The selection criterion was cross-validation using using `smooth.spline`, which picked df-3 as minimizing the CV error.
+
+### Code
+
+```{r, warning=FALSE}
+# Fit splines for multiple df and plot curves
+
+library(splines)
+
+x <- train$Top10perc
+x_grid <- seq(min(x), max(x), length.out = 200)
+
+df_grid <- c(3, 5, 7, 9, 12, 15, 20)
+
+plot(train$Top10perc, train$Outstate, pch=16, cex=0.6,
+     xlab="Top10perc", ylab="Outstate",
+     main="Smoothing spline fits for different df")
+
+cols <- seq_along(df_grid)
+
+for (k in seq_along(df_grid)) {
+  fit_k <- smooth.spline(x = train$Top10perc, y = train$Outstate, df = df_grid[k])
+  pred_k <- predict(fit_k, x = x_grid)$y
+  lines(x_grid, pred_k, lwd=2, col=cols[k])
+}
+
+legend("topleft", legend=paste0("df=", df_grid), col=cols, lwd=2, bty="n")
+
+# Choose the df by minimizing cross-validated error
+
+df_candidates <- 3:25
+
+cv_mse <- sapply(df_candidates, function(d) {
+  fit <- smooth.spline(x=train$Top10perc, y=train$Outstate, df=d, cv=TRUE)
+  
+  fit$cv.crit
+})
+
+best_df <- df_candidates[which.min(cv_mse)]
+best_df
+
+fit_best <- smooth.spline(x=train$Top10perc, y=train$Outstate, df=best_df)
+
+plot(train$Top10perc, train$Outstate, pch=16, cex=0.6,
+     xlab="Top10perc", ylab="Outstate",
+     main=paste("Optimal smoothing spline (df =", best_df, ")"))
+lines(x_grid, predict(fit_best, x_grid)$y, lwd=3)
+```
+
+## Question b: MARS model
+
+### Answer
+
+The fitted MARS model can be written as $\widehat{Outstate}=10100.32+0.40097\,h(\text{Apps}-2694)-2.04034\,h(2081-\text{Accept})+4.95549\,h(942-\text{Enroll})
+-1.47983\,h(1251-\text{F.Undergrad})-0.32893\,h(\text{F.Undergrad}-1251)
+-1.56650\,h(4138-\text{Room.Board})+0.83858\,h(1300-\text{Personal})
+-88.96339\,h(21-\text{perc.alumni})+0.75266\,h(\text{Expend}-6898)-0.74075\,h(\text{Expend}-15494)-27.4719\,h(81-\text{Grad.Rate})$,
+where $h(t)=\max(t,0)$. 
+
+I plotted the partial dependence for an arbitrary predictor in the model using the MARS partial effects plot (see below). 
+
+On the test set, the model achieved $MSE = 2,831,844 (RMSE = 1,682.81)$.
+
+### Code
+```{r, warning=FALSE}
+# Fit MARS on training data
+library(earth)
+library(plotmo)
+
+set.seed(1)
+mars_fit <- earth(
+  Outstate ~ .,
+  data = train,
+  degree = 1,  
+  nfold = 10   
+)
+
+summary(mars_fit)
+
+# Report the regression function
+format(mars_fit)
+
+# Partial dependence plot
+plotmo(mars_fit, pch=16, cex=0.6, caption="MARS partial effects")
+
+# Test error
+pred_mars <- predict(mars_fit, newdata = test)
+mse_mars  <- mean((y_test - pred_mars)^2)
+rmse_mars <- sqrt(mse_mars)
+
+mse_mars
+rmse_mars
+```
+
+## Question c: GAM model
+
+### Answer
+
+I fit a GAM of the form
+$Outstate=\beta_0+s(\text{Top10perc})+s(\text{Room.Board})+s(\text{Expend})+s(\text{Grad.Rate})+\beta_1\text{Apps}+\beta_2\text{Accept}+\cdots+\beta_{11}\text{perc.alumni}+\varepsilon$,
+using smooth terms for `Top10perc`, `Room.Board`, `Expend`, and `Grad.Rate` and linear terms for the remaining predictors. 
+
+I plotted the partial dependence below. 
+
+On the test set, the GAM achieved $MSE = 2,743,197 (RMSE = 1,656.26)$.
+
+### Code
+
+```{r}
+# Fit GAM
+library(mgcv)
+
+set.seed(1)
+gam_fit <- gam(
+  Outstate ~ 
+    s(Top10perc) +
+    s(Room.Board) +
+    s(Expend) +
+    s(Grad.Rate) +
+    Apps + Accept + Enroll + Top25perc + F.Undergrad + P.Undergrad +
+    Books + Personal + PhD + Terminal + S.F.Ratio + perc.alumni,
+  data = train,
+  method = "REML"
+)
+
+summary(gam_fit)
+
+# Plot nonlinear relationships
+par(mfrow=c(2,2))
+plot(gam_fit, shade = TRUE, seWithMean = TRUE)
+par(mfrow=c(1,1))
+
+# Test error
+pred_gam <- predict(gam_fit, newdata = test)
+mse_gam  <- mean((y_test - pred_gam)^2)
+rmse_gam <- sqrt(mse_gam)
+
+mse_gam
+rmse_gam
+```
+
+## Question d: MARS vs Linear model
+
+### Answer
+
+Yes, I would favor MARS for prediction here. 
+
+On the test set, MARS achieves a much lower error ($MSE=2,831,844$ and $RMSE=1,682.81$) than the baseline linear model ($MSE=3,866,573$ and $RMSE=1,966.36$), suggesting that there are important nonlinearities/threshold effects in the predictors that a linear model cannot capture.
+
+### Code
+
+```{r}
+# Fit a baseline linear model 
+lm_fit <- lm(Outstate ~ ., data = train)
+pred_lm <- predict(lm_fit, newdata = test)
+mse_lm  <- mean((y_test - pred_lm)^2)
+rmse_lm <- sqrt(mse_lm)
+
+mse_lm
+rmse_lm
+```
+
+## Question e
+
+In real applications, MARS is not always preferred to a linear model, because there is a trade-off between predictive accuracy and interpretability/simplicity. Linear regression is usually the safer default because it is stable and easy to explain, while MARS is more flexible and can capture nonlinearities and threshold effects.
+
+In this dataset, that extra flexibility is worthwhile: MARS substantially beats the linear baseline on the test set, so for prediction I would pick MARS here.
+
